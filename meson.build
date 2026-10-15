@@ -402,6 +402,13 @@ if enable_libusb
 endif
 config_h.set10('HAVE_LIBUSB', enable_libusb)
 
+# *** Check if we should build with the Chomikuj backend ***
+enable_chomikuj = get_option('chomikuj')
+if enable_chomikuj
+  libsoup_dep = dependency('libsoup-3.0', version: '>= 3.0.0')
+  json_glib_dep = dependency('json-glib-1.0', version: '>= 1.2.0')
+endif
+
 # *** Check for samba ***
 enable_samba = get_option('smb')
 if enable_samba
@@ -522,6 +529,7 @@ summary({
   'afp': enable_afp,
   'archive': enable_archive,
   'cdda': enable_cdda,
+  'chomikuj': enable_chomikuj,
   'dnssd': enable_dnssd,
   'goa': enable_goa,
   'google': enable_google,

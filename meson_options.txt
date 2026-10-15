@@ -5,6 +5,7 @@ option('privileged_group', type: 'string', value: 'wheel', description: 'custom 
 
 option('admin', type: 'boolean', value: true, description: 'build with admin backend')
 option('afc', type: 'boolean', value: true, description: 'build with afc backend and volume monitor')
+option('chomikuj', type: 'boolean', value: true, description: 'build with Chomikuj.pl backend')
 option('afp', type: 'boolean', value: false, description: 'build with afp backends', deprecated: true)
 option('archive', type: 'boolean', value: false, description: 'build with archive backend', deprecated: true)
 option('cdda', type: 'boolean', value: true, description: 'build with cdda backend')

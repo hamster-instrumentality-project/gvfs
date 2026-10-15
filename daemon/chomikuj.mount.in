@@ -1,0 +1,4 @@
+[Mount]
+Type=chomikuj
+Exec=@libexecdir@/gvfsd-chomikuj
+AutoMount=false

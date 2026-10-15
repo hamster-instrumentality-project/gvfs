@@ -405,6 +405,26 @@ if enable_onedrive
   mounts += ['onedrive']
 endif
 
+if enable_chomikuj
+  deps = [
+    libsoup_dep,
+    json_glib_dep,
+  ]
+
+  cflags = [
+    '-DBACKEND_HEADER=gvfsbackendchomikuj.h',
+    '-DDEFAULT_BACKEND_TYPE=chomikuj',
+    '-DBACKEND_TYPES="chomikuj", G_VFS_TYPE_BACKEND_CHOMIKUJ,',
+  ]
+
+  programs += {'gvfsd-chomikuj': {
+    'sources': files('gvfsbackendchomikuj.c', 'chomikujclient.c'),
+    'dependencies': deps,
+    'c_args': cflags,
+  }}
+  mounts += ['chomikuj']
+endif
+
 if enable_gphoto2
   deps = [
     gio_unix_dep,
