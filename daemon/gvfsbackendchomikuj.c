@@ -80,6 +80,8 @@ typedef struct
   GInputStream *stream;
   SoupMessage *msg;
   goffset offset;
+  goffset size;
+  gboolean eof;
 } ChomikujReadHandle;
 
 typedef struct
@@ -713,6 +715,7 @@ g_vfs_backend_chomikuj_open_for_read (GVfsBackend         *backend,
   handle->client = self->client;
   handle->file_id = e->id;
   handle->path = g_strdup (filename);
+  handle->size = e->size;
   handle->stream = chomikuj_client_open_read (self->client, e->id, 0,
                                               &handle->msg,
                                               G_VFS_JOB (job)->cancellable,
@@ -727,6 +730,17 @@ g_vfs_backend_chomikuj_open_for_read (GVfsBackend         *backend,
       g_error_free (error);
       return;
     }
+
+  /* The API reports sizes rounded down to whole kilobytes; the response to the
+   * full (non-ranged) GET carries the exact length, which G_SEEK_END needs. */
+  {
+    goffset len;
+
+    len = soup_message_headers_get_content_length (
+            soup_message_get_response_headers (handle->msg));
+    if (len > 0)
+      handle->size = len;
+  }
 
   g_vfs_job_open_for_read_set_handle (job, handle);
   g_vfs_job_open_for_read_set_can_seek (job, TRUE);
@@ -743,6 +757,14 @@ g_vfs_backend_chomikuj_read (GVfsBackend      *backend,
   ChomikujReadHandle *h = handle;
   GError *error = NULL;
   gssize n;
+
+  /* A seek may have moved us to or past EOF, where there is no body to read. */
+  if (h->eof)
+    {
+      g_vfs_job_read_set_size (job, 0);
+      g_vfs_job_succeeded (G_VFS_JOB (job));
+      return;
+    }
 
   n = g_input_stream_read (h->stream, buffer, bytes_requested,
                            G_VFS_JOB (job)->cancellable, &error);
@@ -773,7 +795,7 @@ g_vfs_backend_chomikuj_seek_on_read (GVfsBackend      *backend,
     {
     case G_SEEK_SET: target = offset; break;
     case G_SEEK_CUR: target = h->offset + offset; break;
-    case G_SEEK_END: target = offset; break; /* size unknown; treat as absolute */
+    case G_SEEK_END: target = h->size + offset; break;
     default:
       g_vfs_job_failed_literal (G_VFS_JOB (job), G_IO_ERROR,
                                 G_IO_ERROR_INVALID_ARGUMENT, _("Invalid seek"));
@@ -787,26 +809,37 @@ g_vfs_backend_chomikuj_seek_on_read (GVfsBackend      *backend,
       return;
     }
 
-  if (target == h->offset)
+  if (target != h->offset)
     {
-      g_vfs_job_succeeded (G_VFS_JOB (job));
-      return;
+      /* Re-establish the stream at the new position.  Seeking to or past the
+       * end leaves no body to fetch, so just mark the handle and let read()
+       * report the end of file. */
+      g_clear_object (&h->stream);
+      g_clear_object (&h->msg);
+
+      if (target >= h->size)
+        {
+          h->eof = TRUE;
+        }
+      else
+        {
+          h->stream = chomikuj_client_open_read (h->client, h->file_id, target,
+                                                 &h->msg,
+                                                 G_VFS_JOB (job)->cancellable,
+                                                 &error);
+          if (h->stream == NULL)
+            {
+              g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
+              g_error_free (error);
+              return;
+            }
+          h->eof = FALSE;
+        }
+
+      h->offset = target;
     }
 
-  g_clear_object (&h->stream);
-  g_clear_object (&h->msg);
-
-  h->stream = chomikuj_client_open_read (h->client, h->file_id, target,
-                                         &h->msg, G_VFS_JOB (job)->cancellable,
-                                         &error);
-  if (h->stream == NULL)
-    {
-      g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
-      g_error_free (error);
-      return;
-    }
-
-  h->offset = target;
+  g_vfs_job_seek_read_set_offset (job, h->offset);
   g_vfs_job_succeeded (G_VFS_JOB (job));
 }
 
@@ -850,6 +883,10 @@ g_vfs_backend_chomikuj_query_info_on_read (GVfsBackend           *backend,
   g_file_info_copy_into (extra, info);
   g_object_unref (extra);
   chomikuj_entry_free (e);
+
+  /* The listing reports sizes rounded down to whole kilobytes; the open stream
+   * carries the exact length. */
+  g_file_info_set_size (info, h->size);
 
   g_vfs_job_succeeded (G_VFS_JOB (job));
 }
