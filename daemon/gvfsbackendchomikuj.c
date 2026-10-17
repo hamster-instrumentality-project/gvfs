@@ -662,26 +662,12 @@ g_vfs_backend_chomikuj_query_fs_info (GVfsBackend           *backend,
                                       GFileInfo             *info,
                                       GFileAttributeMatcher *matcher)
 {
-  GVfsBackendChomikuj *self = G_VFS_BACKEND_CHOMIKUJ (backend);
-
+  /* The API exposes no storage capacity (and account storage is not limited),
+   * so filesystem::size/used/free are deliberately left unset.  Reporting the
+   * download-transfer balance as free space is wrong and, worse, makes file
+   * managers abort a copy with a spurious "not enough space" prompt. */
   g_file_info_set_attribute_string (info, G_FILE_ATTRIBUTE_FILESYSTEM_TYPE, "chomikuj");
   g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_FILESYSTEM_REMOTE, TRUE);
-
-  if (g_file_attribute_matcher_matches (matcher, G_FILE_ATTRIBUTE_FILESYSTEM_SIZE) ||
-      g_file_attribute_matcher_matches (matcher, G_FILE_ATTRIBUTE_FILESYSTEM_FREE))
-    {
-      guint64 total = 0, used = 0, free_space = 0;
-      GError *error = NULL;
-
-      if (chomikuj_client_query_transfer (self->client, &total, &used, &free_space,
-                                          G_VFS_JOB (job)->cancellable, &error))
-        {
-          g_file_info_set_attribute_uint64 (info, G_FILE_ATTRIBUTE_FILESYSTEM_SIZE, total);
-          g_file_info_set_attribute_uint64 (info, G_FILE_ATTRIBUTE_FILESYSTEM_USED, used);
-          g_file_info_set_attribute_uint64 (info, G_FILE_ATTRIBUTE_FILESYSTEM_FREE, free_space);
-        }
-      g_clear_error (&error);
-    }
 
   g_vfs_job_succeeded (G_VFS_JOB (job));
 }

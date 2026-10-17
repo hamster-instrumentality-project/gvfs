@@ -1058,42 +1058,6 @@ chomikuj_client_open_read (ChomikujClient  *client,
   return stream;
 }
 
-gboolean
-chomikuj_client_query_transfer (ChomikujClient  *client,
-                                guint64         *total,
-                                guint64         *used,
-                                guint64         *free_space,
-                                GCancellable    *cancellable,
-                                GError         **error)
-{
-  JsonObject *resp;
-  guint64 quota_periodical = 0, quota_additional = 0, quota_left = 0;
-
-  resp = chomikuj_call (client, "GET", CHOMIKUJ_API_PREFIX "/account/transfer",
-                        NULL, NULL, TRUE, cancellable, error);
-  if (resp == NULL)
-    return FALSE;
-
-  if (json_object_has_member (resp, "QuotaPeriodical"))
-    quota_periodical = (guint64) json_object_get_int_member (resp, "QuotaPeriodical");
-  if (json_object_has_member (resp, "QuotaAdditional"))
-    quota_additional = (guint64) json_object_get_int_member (resp, "QuotaAdditional");
-  if (json_object_has_member (resp, "QuotaLeft"))
-    quota_left = (guint64) json_object_get_int_member (resp, "QuotaLeft");
-  json_object_unref (resp);
-
-  if (total != NULL)
-    *total = quota_periodical + quota_additional;
-  if (free_space != NULL)
-    *free_space = quota_left;
-  if (used != NULL)
-    {
-      guint64 t = quota_periodical + quota_additional;
-      *used = t > quota_left ? t - quota_left : 0;
-    }
-  return TRUE;
-}
-
 static guint
 send_chunk (ChomikujClient  *client,
             const gchar     *url,

@@ -114,13 +114,6 @@ GInputStream *chomikuj_client_open_read (ChomikujClient  *client,
                                          GCancellable    *cancellable,
                                          GError         **error);
 
-gboolean chomikuj_client_query_transfer (ChomikujClient *client,
-                                         guint64        *total,
-                                         guint64        *used,
-                                         guint64        *free_space,
-                                         GCancellable   *cancellable,
-                                         GError        **error);
-
 gboolean chomikuj_client_upload_file (ChomikujClient       *client,
                                       const gchar          *local_path,
                                       const gchar          *folder_id,
