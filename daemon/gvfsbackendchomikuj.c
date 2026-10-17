@@ -35,6 +35,7 @@
 #include <config.h>
 
 #include <string.h>
+#include <sys/stat.h>
 #include <glib/gstdio.h>
 #include <glib/gi18n.h>
 #include <gio/gio.h>
@@ -42,6 +43,7 @@
 #include "gvfsbackendchomikuj.h"
 #include "chomikujclient.h"
 #include "gvfskeyring.h"
+#include "gvfsdaemonutils.h"
 
 #include "gvfsjobmount.h"
 #include "gvfsjobunmount.h"
@@ -62,6 +64,9 @@
 #include "gvfsjobdelete.h"
 #include "gvfsjobmakedirectory.h"
 #include "gvfsjobmove.h"
+#include "gvfsjobcopy.h"
+#include "gvfsjobpull.h"
+#include "gvfsjobpush.h"
 
 #define ROOT_ID "0"
 #define DIR_CACHE_TTL (5 * G_USEC_PER_SEC)
@@ -1155,6 +1160,461 @@ g_vfs_backend_chomikuj_move (GVfsBackend          *backend,
 }
 
 /* ------------------------------------------------------------------ */
+/*  Transfers (push, pull and daemon-to-daemon copy)                   */
+/* ------------------------------------------------------------------ */
+
+/* Opens @entry for reading and reports its exact size (the listing rounds
+ * down to whole kilobytes, the response carries the real length). */
+static GInputStream *
+open_entry_for_read (ChomikujClient  *client,
+                     ChomikujEntry   *entry,
+                     goffset         *out_size,
+                     SoupMessage    **out_msg,
+                     GCancellable    *cancellable,
+                     GError         **error)
+{
+  GInputStream *stream;
+  goffset size;
+
+  stream = chomikuj_client_open_read (client, entry->id, 0, out_msg,
+                                      cancellable, error);
+  if (stream == NULL)
+    return NULL;
+
+  size = entry->size;
+  {
+    goffset len;
+
+    len = soup_message_headers_get_content_length (
+            soup_message_get_response_headers (*out_msg));
+    if (len > 0)
+      size = len;
+  }
+
+  *out_size = size;
+  return stream;
+}
+
+/* Maps the progress of one phase of a two-phase transfer onto a sub-range of
+ * [0, total], so that the application sees a single monotonic percentage. */
+typedef struct
+{
+  GFileProgressCallback callback;
+  gpointer              data;
+  goffset               total;
+  goffset               base;
+  goffset               span;
+} ScaledProgress;
+
+static void
+scaled_progress_cb (goffset current,
+                    goffset total,
+                    gpointer user_data)
+{
+  ScaledProgress *p = user_data;
+  goffset mapped;
+
+  if (p->callback == NULL)
+    return;
+
+  if (total <= 0)
+    mapped = p->base + p->span;
+  else
+    mapped = p->base + (goffset) ((gdouble) MIN (current, total) * p->span
+                                  / (gdouble) total);
+
+  p->callback (mapped, p->total, p->data);
+}
+
+static gboolean
+delete_remote_entry (GVfsBackendChomikuj *self,
+                     ChomikujEntry        *entry,
+                     GCancellable         *cancellable,
+                     GError              **error)
+{
+  if (entry->is_dir)
+    return chomikuj_client_delete (self->client, NULL, 0, &entry->id, 1,
+                                   cancellable, error);
+
+  return chomikuj_client_delete (self->client, &entry->id, 1, NULL, 0,
+                                 cancellable, error);
+}
+
+static void
+g_vfs_backend_chomikuj_push (GVfsBackend           *backend,
+                             GVfsJobPush           *job,
+                             const gchar           *destination,
+                             const gchar           *local_path,
+                             GFileCopyFlags         flags,
+                             gboolean               remove_source,
+                             GFileProgressCallback  progress_callback,
+                             gpointer               progress_callback_data)
+{
+  GVfsBackendChomikuj *self = G_VFS_BACKEND_CHOMIKUJ (backend);
+  GError *error = NULL;
+  GStatBuf st;
+  gchar *parent_id = NULL, *basename = NULL;
+  ChomikujEntry *existing = NULL;
+  GFile *local_file = NULL;
+
+  /* Chomikuj uploads cannot create backups.  Let GIO's fallback handle it. */
+  if (flags & G_FILE_COPY_BACKUP)
+    {
+      g_vfs_job_failed_literal (G_VFS_JOB (job), G_IO_ERROR,
+                                G_IO_ERROR_NOT_SUPPORTED,
+                                _("Operation not supported"));
+      return;
+    }
+
+  /* Directories are handled recursively by GIO through the stream API. */
+  if (g_lstat (local_path, &st) != 0)
+    goto not_supported;
+  if (S_ISLNK (st.st_mode))
+    {
+      if (flags & G_FILE_COPY_NOFOLLOW_SYMLINKS)
+        goto not_supported;
+      if (g_stat (local_path, &st) != 0)
+        goto not_supported;
+    }
+  if (!S_ISREG (st.st_mode))
+    goto not_supported;
+
+  if (!resolve_parent (self, destination, &parent_id, &basename,
+                       G_VFS_JOB (job)->cancellable, &error))
+    goto fail;
+
+  existing = find_entry (self, parent_id, basename,
+                         G_VFS_JOB (job)->cancellable, &error);
+  if (existing != NULL)
+    {
+      if (!(flags & G_FILE_COPY_OVERWRITE))
+        {
+          g_set_error (&error, G_IO_ERROR, G_IO_ERROR_EXISTS,
+                       "“%s” already exists", basename);
+          goto fail;
+        }
+
+      /* The service never overwrites on upload; remove the old entry first. */
+      if (!delete_remote_entry (self, existing,
+                                G_VFS_JOB (job)->cancellable, &error))
+        goto fail;
+
+      g_clear_pointer (&existing, chomikuj_entry_free);
+      invalidate_dir (self, parent_id);
+    }
+  else if (error != NULL)
+    {
+      goto fail;
+    }
+
+  if (!chomikuj_client_upload_file (self->client, local_path, parent_id,
+                                    basename, progress_callback,
+                                    progress_callback_data,
+                                    G_VFS_JOB (job)->cancellable, &error))
+    goto fail;
+
+  invalidate_dir (self, parent_id);
+
+  if (remove_source)
+    {
+      local_file = g_file_new_for_path (local_path);
+      if (!g_file_delete (local_file, G_VFS_JOB (job)->cancellable, &error))
+        goto fail;
+    }
+
+  g_clear_object (&local_file);
+  g_free (parent_id);
+  g_free (basename);
+  g_vfs_job_succeeded (G_VFS_JOB (job));
+  return;
+
+ not_supported:
+  g_vfs_job_failed_literal (G_VFS_JOB (job), G_IO_ERROR,
+                            G_IO_ERROR_NOT_SUPPORTED,
+                            _("Operation not supported"));
+  return;
+
+ fail:
+  g_clear_object (&local_file);
+  g_clear_pointer (&existing, chomikuj_entry_free);
+  g_free (parent_id);
+  g_free (basename);
+  g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
+  g_error_free (error);
+}
+
+static void
+g_vfs_backend_chomikuj_pull (GVfsBackend           *backend,
+                             GVfsJobPull           *job,
+                             const gchar           *source,
+                             const gchar           *local_path,
+                             GFileCopyFlags         flags,
+                             gboolean               remove_source,
+                             GFileProgressCallback  progress_callback,
+                             gpointer               progress_callback_data)
+{
+  GVfsBackendChomikuj *self = G_VFS_BACKEND_CHOMIKUJ (backend);
+  GError *error = NULL;
+  ChomikujEntry *entry = NULL;
+  GInputStream *in = NULL;
+  GOutputStream *out = NULL;
+  SoupMessage *msg = NULL;
+  GFile *local_file = NULL;
+  goffset size = 0;
+
+  if (flags & G_FILE_COPY_BACKUP)
+    {
+      g_vfs_job_failed_literal (G_VFS_JOB (job), G_IO_ERROR,
+                                G_IO_ERROR_NOT_SUPPORTED,
+                                _("Operation not supported"));
+      return;
+    }
+
+  entry = resolve_entry (self, source, G_VFS_JOB (job)->cancellable, &error);
+  if (entry == NULL)
+    goto fail;
+
+  /* Directories are handled recursively by GIO through the stream API. */
+  if (entry->is_dir)
+    {
+      g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                           _("Operation not supported"));
+      goto fail;
+    }
+
+  local_file = g_file_new_for_path (local_path);
+  if (!(flags & G_FILE_COPY_OVERWRITE) &&
+      g_file_query_exists (local_file, G_VFS_JOB (job)->cancellable))
+    {
+      g_set_error (&error, G_IO_ERROR, G_IO_ERROR_EXISTS,
+                   "“%s” already exists", local_path);
+      goto fail;
+    }
+
+  in = open_entry_for_read (self->client, entry, &size, &msg,
+                            G_VFS_JOB (job)->cancellable, &error);
+  if (in == NULL)
+    goto fail;
+
+  if (flags & G_FILE_COPY_OVERWRITE)
+    out = G_OUTPUT_STREAM (g_file_replace (local_file, NULL, FALSE,
+                                           G_FILE_CREATE_REPLACE_DESTINATION,
+                                           G_VFS_JOB (job)->cancellable,
+                                           &error));
+  else
+    out = G_OUTPUT_STREAM (g_file_create (local_file, G_FILE_CREATE_NONE,
+                                          G_VFS_JOB (job)->cancellable,
+                                          &error));
+  if (out == NULL)
+    goto fail;
+
+  if (gvfs_output_stream_splice (out, in, G_OUTPUT_STREAM_SPLICE_CLOSE_TARGET,
+                                 size, progress_callback,
+                                 progress_callback_data,
+                                 G_VFS_JOB (job)->cancellable, &error) < 0)
+    goto fail;
+
+  g_clear_object (&out);
+  g_clear_object (&in);
+  g_clear_object (&msg);
+
+  if (remove_source)
+    {
+      if (!delete_remote_entry (self, entry,
+                                G_VFS_JOB (job)->cancellable, &error))
+        goto fail;
+      invalidate_all (self);
+    }
+
+  g_clear_pointer (&entry, chomikuj_entry_free);
+  g_clear_object (&local_file);
+  g_vfs_job_succeeded (G_VFS_JOB (job));
+  return;
+
+ fail:
+  g_clear_object (&out);
+  g_clear_object (&in);
+  g_clear_object (&msg);
+  g_clear_pointer (&entry, chomikuj_entry_free);
+  g_clear_object (&local_file);
+  g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
+  g_error_free (error);
+}
+
+static void
+g_vfs_backend_chomikuj_copy (GVfsBackend           *backend,
+                             GVfsJobCopy           *job,
+                             const gchar           *source,
+                             const gchar           *destination,
+                             GFileCopyFlags         flags,
+                             GFileProgressCallback  progress_callback,
+                             gpointer               progress_callback_data)
+{
+  GVfsBackendChomikuj *self = G_VFS_BACKEND_CHOMIKUJ (backend);
+  GError *error = NULL;
+  ChomikujEntry *src = NULL, *dst_entry = NULL, *target = NULL;
+  gchar *dst_parent = NULL, *dst_base = NULL;
+  gchar *target_parent = NULL, *target_name = NULL;
+  gchar *tmp_path = NULL;
+  GFile *tmp_file = NULL;
+  GOutputStream *out = NULL;
+  GInputStream *in = NULL;
+  SoupMessage *msg = NULL;
+  ScaledProgress progress;
+  goffset size = 0;
+  gint fd;
+
+  /* Chomikuj uploads cannot create backups.  Let GIO's fallback handle it. */
+  if (flags & G_FILE_COPY_BACKUP)
+    {
+      g_vfs_job_failed_literal (G_VFS_JOB (job), G_IO_ERROR,
+                                G_IO_ERROR_NOT_SUPPORTED,
+                                _("Operation not supported"));
+      return;
+    }
+
+  src = resolve_entry (self, source, G_VFS_JOB (job)->cancellable, &error);
+  if (src == NULL)
+    goto fail;
+
+  /* Directories are handled recursively by GIO through the stream API. */
+  if (src->is_dir)
+    {
+      g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                           _("Operation not supported"));
+      goto fail;
+    }
+
+  if (!resolve_parent (self, destination, &dst_parent, &dst_base,
+                       G_VFS_JOB (job)->cancellable, &error))
+    goto fail;
+
+  dst_entry = find_entry (self, dst_parent, dst_base,
+                          G_VFS_JOB (job)->cancellable, &error);
+  if (dst_entry != NULL && dst_entry->is_dir)
+    {
+      target_parent = g_strdup_printf ("%" G_GINT64_FORMAT, dst_entry->id);
+      target_name = g_strdup (src->name);
+    }
+  else
+    {
+      target_parent = g_strdup (dst_parent);
+      target_name = g_strdup (dst_base);
+    }
+
+  target = find_entry (self, target_parent, target_name,
+                       G_VFS_JOB (job)->cancellable, &error);
+  if (target != NULL)
+    {
+      if (target->id == src->id)
+        {
+          g_set_error (&error, G_IO_ERROR, G_IO_ERROR_EXISTS,
+                       "“%s” already exists", target_name);
+          goto fail;
+        }
+
+      if (!(flags & G_FILE_COPY_OVERWRITE))
+        {
+          g_set_error (&error, G_IO_ERROR, G_IO_ERROR_EXISTS,
+                       "“%s” already exists", target_name);
+          goto fail;
+        }
+
+      if (!delete_remote_entry (self, target,
+                                G_VFS_JOB (job)->cancellable, &error))
+        goto fail;
+
+      g_clear_pointer (&target, chomikuj_entry_free);
+      invalidate_dir (self, target_parent);
+    }
+  else if (error != NULL)
+    {
+      goto fail;
+    }
+
+  /* There is no server-side copy, so download to a temporary file and upload
+   * it again.  Progress covers both phases, scaled to the file size. */
+  fd = g_file_open_tmp ("gvfs-chomikuj-copy-XXXXXX", &tmp_path, &error);
+  if (fd < 0)
+    goto fail;
+  g_close (fd, NULL);
+
+  tmp_file = g_file_new_for_path (tmp_path);
+  out = G_OUTPUT_STREAM (g_file_replace (tmp_file, NULL, FALSE,
+                                         G_FILE_CREATE_NONE,
+                                         G_VFS_JOB (job)->cancellable,
+                                         &error));
+  if (out == NULL)
+    goto fail;
+
+  in = open_entry_for_read (self->client, src, &size, &msg,
+                            G_VFS_JOB (job)->cancellable, &error);
+  if (in == NULL)
+    goto fail;
+
+  progress.callback = progress_callback;
+  progress.data = progress_callback_data;
+  progress.total = size;
+  progress.base = 0;
+  progress.span = size / 2;
+
+  if (gvfs_output_stream_splice (out, in, G_OUTPUT_STREAM_SPLICE_CLOSE_TARGET,
+                                 size,
+                                 progress_callback != NULL ? scaled_progress_cb
+                                                           : NULL,
+                                 &progress,
+                                 G_VFS_JOB (job)->cancellable, &error) < 0)
+    goto fail;
+
+  g_clear_object (&out);
+  g_clear_object (&in);
+  g_clear_object (&msg);
+
+  progress.base = size / 2;
+  progress.span = size - size / 2;
+
+  if (!chomikuj_client_upload_file (self->client, tmp_path, target_parent,
+                                    target_name,
+                                    progress_callback != NULL ? scaled_progress_cb
+                                                              : NULL,
+                                    &progress,
+                                    G_VFS_JOB (job)->cancellable, &error))
+    goto fail;
+
+  invalidate_dir (self, target_parent);
+  g_clear_pointer (&tmp_file, g_object_unref);
+  g_unlink (tmp_path);
+  g_free (tmp_path);
+  g_clear_pointer (&src, chomikuj_entry_free);
+  g_clear_pointer (&target, chomikuj_entry_free);
+  g_clear_pointer (&dst_entry, chomikuj_entry_free);
+  g_free (dst_parent);
+  g_free (dst_base);
+  g_free (target_parent);
+  g_free (target_name);
+  g_vfs_job_succeeded (G_VFS_JOB (job));
+  return;
+
+ fail:
+  g_clear_object (&out);
+  g_clear_object (&in);
+  g_clear_object (&msg);
+  g_clear_pointer (&tmp_file, g_object_unref);
+  if (tmp_path != NULL)
+    g_unlink (tmp_path);
+  g_free (tmp_path);
+  g_clear_pointer (&src, chomikuj_entry_free);
+  g_clear_pointer (&target, chomikuj_entry_free);
+  g_clear_pointer (&dst_entry, chomikuj_entry_free);
+  g_free (dst_parent);
+  g_free (dst_base);
+  g_free (target_parent);
+  g_free (target_name);
+  g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
+  g_error_free (error);
+}
+
+/* ------------------------------------------------------------------ */
 /*  Writing                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -1483,6 +1943,9 @@ g_vfs_backend_chomikuj_class_init (GVfsBackendChomikujClass *klass)
   backend_class->set_display_name = g_vfs_backend_chomikuj_set_display_name;
   backend_class->delete = g_vfs_backend_chomikuj_delete;
   backend_class->move = g_vfs_backend_chomikuj_move;
+  backend_class->copy = g_vfs_backend_chomikuj_copy;
+  backend_class->pull = g_vfs_backend_chomikuj_pull;
+  backend_class->push = g_vfs_backend_chomikuj_push;
 }
 
 static void
