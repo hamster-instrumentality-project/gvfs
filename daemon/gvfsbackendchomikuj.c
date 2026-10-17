@@ -402,9 +402,14 @@ entry_to_file_info (ChomikujEntry          *e,
                                              : G_FILE_TYPE_REGULAR);
   g_file_info_set_size (info, e->is_dir ? 0 : e->size);
   /* The API's IsHidden on files is a visibility/privacy flag, not the Unix
-   * dot-file sense, so only folders are exposed as hidden. */
-  if (e->is_dir)
-    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN, e->hidden);
+   * dot-file sense, so only folders are ever reported as hidden.  The standard
+   * booleans are always set, even when false, because GLib's typed getters
+   * (g_file_info_get_is_hidden() and friends) emit a critical when they are
+   * missing. */
+  g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN,
+                                     e->is_dir && e->hidden);
+  g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_STANDARD_IS_BACKUP, FALSE);
+  g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK, FALSE);
   g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_STANDARD_IS_VIRTUAL, FALSE);
 
   id = g_strdup_printf ("%" G_GINT64_FORMAT, e->id);
