@@ -47,7 +47,14 @@
 #define CHOMIKUJ_CLIENT_VER    "3.8.4"
 #define CHOMIKUJ_UPLOAD_CHUNK  (512 * 1024)
 #define CHOMIKUJ_MAX_PAGE      50
-#define CHOMIKUJ_MAX_UPLOAD_RETRIES 5
+/* Cheap retries of a single chunk (transient HTTP status or dropped
+ * connection) and expensive full restarts (409, which discards everything
+ * uploaded so far and starts again from byte 0). */
+#define CHOMIKUJ_MAX_CHUNK_RETRIES 5
+#define CHOMIKUJ_MAX_UPLOAD_RESETS 3
+/* Bounds for the jittered exponential backoff used between chunk retries. */
+#define CHOMIKUJ_RETRY_BASE_US     (500 * 1000)
+#define CHOMIKUJ_RETRY_MAX_US      (8 * 1000 * 1000)
 
 /*
  * BuildConfig.SECRET_KEY, verbatim from the APK.  It is a single, app-wide
@@ -348,11 +355,15 @@ chomikuj_http (ChomikujClient  *self,
                const gchar     *body,
                const gchar     *token,
                gboolean         send_api_key,
+               gboolean         may_retry,
                guint           *out_status,
                GCancellable    *cancellable,
                GError         **error)
 {
   gboolean idempotent = method_is_idempotent (method);
+  /* A request may be retried when the method is safe to repeat, or when the
+   * caller vouches for it (e.g. the upload negotiation). */
+  gboolean retryable = idempotent || may_retry;
   guint attempt = 0;
   GBytes *bytes = NULL;
 
@@ -389,7 +400,7 @@ chomikuj_http (ChomikujClient  *self,
 
       if (bytes == NULL)
         {
-          if (idempotent && !g_cancellable_is_cancelled (cancellable) &&
+          if (retryable && !g_cancellable_is_cancelled (cancellable) &&
               attempt < self->max_retries)
             {
               attempt++;
@@ -401,7 +412,8 @@ chomikuj_http (ChomikujClient  *self,
           return NULL;
         }
 
-      if ((status == 429 || (idempotent && status >= 500)) &&
+      if ((status == 429 ||
+           (retryable && (status == 408 || status >= 500))) &&
           attempt < self->max_retries)
         {
           g_bytes_unref (bytes);
@@ -524,6 +536,7 @@ chomikuj_call (ChomikujClient  *self,
                const gchar     *query,
                const gchar     *body,
                gboolean         send_api_key,
+               gboolean         may_retry,
                GCancellable    *cancellable,
                GError         **error)
 {
@@ -540,7 +553,7 @@ chomikuj_call (ChomikujClient  *self,
                          query != NULL ? query : "");
 
   bytes = chomikuj_http (self, method, url, body, token, send_api_key,
-                         &status, cancellable, error);
+                         may_retry, &status, cancellable, error);
   g_free (token);
   g_free (url);
   if (bytes == NULL)
@@ -607,7 +620,14 @@ chomikuj_client_new (const gchar   *account_name,
                                       CHOMIKUJ_CLIENT_VER, device_id, "GVfs");
   g_free (device_id);
 
-  self->base_url = g_strdup (CHOMIKUJ_BASE_URL);
+  /* CHOMIKUJ_BASE_URL lets the test suite point the client at a local mock
+   * server in order to exercise the retry paths deterministically. */
+  {
+    const gchar *base_url = g_getenv ("CHOMIKUJ_BASE_URL");
+
+    self->base_url = g_strdup (base_url != NULL && *base_url != '\0'
+                               ? base_url : CHOMIKUJ_BASE_URL);
+  }
   self->account_name = g_strdup (account_name);
   self->max_retries = 2;
 
@@ -647,7 +667,7 @@ chomikuj_client_login (ChomikujClient  *client,
 
   resp = chomikuj_call (client, "POST",
                         CHOMIKUJ_API_PREFIX "/account/login",
-                        NULL, body, FALSE, cancellable, error);
+                        NULL, body, FALSE, FALSE, cancellable, error);
   g_free (body);
 
   if (resp == NULL)
@@ -785,7 +805,7 @@ chomikuj_client_list_folder (ChomikujClient  *client,
 
       query = g_strdup_printf ("Parent=%s&page=%d", escaped_parent, page);
       resp = chomikuj_call (client, "GET", CHOMIKUJ_API_PREFIX "/folders",
-                            query, NULL, TRUE, cancellable, error);
+                            query, NULL, TRUE, FALSE, cancellable, error);
       g_free (query);
 
       if (resp == NULL)
@@ -847,7 +867,7 @@ chomikuj_client_make_folder (ChomikujClient  *client,
   body = json_object_to_string (req);
 
   resp = chomikuj_call (client, "POST", CHOMIKUJ_API_PREFIX "/folders/create",
-                        NULL, body, TRUE, cancellable, error);
+                        NULL, body, TRUE, FALSE, cancellable, error);
   g_free (body);
   if (resp == NULL)
     return FALSE;
@@ -891,7 +911,7 @@ chomikuj_client_change_name (ChomikujClient  *client,
     }
   body = json_object_to_string (req);
 
-  resp = chomikuj_call (client, "POST", path, NULL, body, TRUE,
+  resp = chomikuj_call (client, "POST", path, NULL, body, TRUE, FALSE,
                         cancellable, error);
   g_free (body);
   if (resp == NULL)
@@ -930,7 +950,7 @@ chomikuj_client_delete (ChomikujClient  *client,
 
   /* The endpoint returns an empty body; success is HTTP-only. */
   resp = chomikuj_call (client, "POST", CHOMIKUJ_API_PREFIX "/files/delete",
-                        NULL, body, TRUE, cancellable, error);
+                        NULL, body, TRUE, FALSE, cancellable, error);
   g_free (body);
   if (resp != NULL)
     json_object_unref (resp);
@@ -972,7 +992,7 @@ chomikuj_client_move (ChomikujClient  *client,
   body = json_object_to_string (req);
 
   resp = chomikuj_call (client, "POST", CHOMIKUJ_API_PREFIX "/files/move",
-                        NULL, body, TRUE, cancellable, error);
+                        NULL, body, TRUE, FALSE, cancellable, error);
   g_free (body);
   if (resp != NULL)
     json_object_unref (resp);
@@ -991,7 +1011,7 @@ chomikuj_client_get_download_url (ChomikujClient  *client,
 
   query = g_strdup_printf ("FileId=%" G_GINT64_FORMAT, file_id);
   resp = chomikuj_call (client, "GET", CHOMIKUJ_API_PREFIX "/files/download",
-                        query, NULL, TRUE, cancellable, error);
+                        query, NULL, TRUE, FALSE, cancellable, error);
   g_free (query);
   if (resp == NULL)
     return NULL;
@@ -1056,6 +1076,33 @@ chomikuj_client_open_read (ChomikujClient  *client,
   g_free (url);
   *out_msg = msg;
   return stream;
+}
+
+/* Sleeps for a jittered, exponentially increasing delay while remaining
+ * responsive to @cancellable.  @attempt is 1-based.  Returns FALSE if the
+ * operation was cancelled while waiting. */
+static gboolean
+upload_retry_sleep (guint         attempt,
+                    GCancellable *cancellable)
+{
+  guint64 delay, step, remaining;
+
+  delay = (guint64) CHOMIKUJ_RETRY_BASE_US << (MIN (MAX (attempt, 1), 5) - 1);
+  delay = MIN (delay, (guint64) CHOMIKUJ_RETRY_MAX_US);
+  if (delay > 0)
+    delay = (guint64) g_random_int_range (0, (gint) delay);
+
+  remaining = delay;
+  while (remaining > 0)
+    {
+      if (g_cancellable_is_cancelled (cancellable))
+        return FALSE;
+      step = MIN (remaining, (guint64) 100000);
+      g_usleep ((gulong) step);
+      remaining -= step;
+    }
+
+  return !g_cancellable_is_cancelled (cancellable);
 }
 
 static guint
@@ -1170,7 +1217,7 @@ chomikuj_client_upload_file (ChomikujClient       *client,
 
   resp = chomikuj_call (client, "POST",
                         CHOMIKUJ_API_PREFIX "/files/upload/partialUpload",
-                        NULL, body, TRUE, cancellable, error);
+                        NULL, body, TRUE, TRUE, cancellable, error);
   g_free (body);
   if (resp == NULL)
     return FALSE;
@@ -1249,37 +1296,12 @@ chomikuj_client_upload_file (ChomikujClient       *client,
                          start, end_off, cancellable, error);
       g_free (buf);
 
-      if (code == 0)
-        goto out; /* network error already set */
-
       if (code == 200)
         {
           if (progress != NULL)
             progress (size, size, user_data);
           ok = TRUE;
           break;
-        }
-      else if (code == 409)
-        {
-          if (++resets > CHOMIKUJ_MAX_UPLOAD_RETRIES)
-            {
-              g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                                   "Upload reset too many times");
-              goto out;
-            }
-          chunk = 0;
-          terminal = 0;
-          continue;
-        }
-      else if (code == 408 || code == 410 || code == 429 || (code >= 500 && code < 600))
-        {
-          if (++retries > CHOMIKUJ_MAX_UPLOAD_RETRIES)
-            {
-              g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                           "Upload failed (HTTP %u)", code);
-              goto out;
-            }
-          continue;
         }
       else if (code == 206)
         {
@@ -1296,6 +1318,52 @@ chomikuj_client_upload_file (ChomikujClient       *client,
           chunk = (gint64) end_off;
           if (progress != NULL)
             progress ((goffset) chunk, (goffset) size, user_data);
+          continue;
+        }
+      else if (code == 409)
+        {
+          if (++resets > CHOMIKUJ_MAX_UPLOAD_RESETS)
+            {
+              g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                                   "Upload reset too many times");
+              goto out;
+            }
+          retries = 0;
+          chunk = 0;
+          terminal = 0;
+          if (!upload_retry_sleep (resets, cancellable))
+            {
+              g_cancellable_set_error_if_cancelled (cancellable, error);
+              goto out;
+            }
+          continue;
+        }
+      else if (code == 0 || code == 408 || code == 410 || code == 429 ||
+               (code >= 500 && code < 600))
+        {
+          /* A dropped connection (code == 0) or a transient server status:
+           * retry the very same chunk after a jittered backoff. */
+          if (g_cancellable_is_cancelled (cancellable))
+            {
+              if (error != NULL && *error == NULL)
+                g_cancellable_set_error_if_cancelled (cancellable, error);
+              goto out;
+            }
+          if (++retries > CHOMIKUJ_MAX_CHUNK_RETRIES)
+            {
+              if (code != 0)
+                g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                             "Upload failed (HTTP %u)", code);
+              /* code == 0: keep the network error set by send_chunk() */
+              goto out;
+            }
+          if (code == 0)
+            g_clear_error (error);
+          if (!upload_retry_sleep (retries, cancellable))
+            {
+              g_cancellable_set_error_if_cancelled (cancellable, error);
+              goto out;
+            }
           continue;
         }
       else if (code >= 400)
